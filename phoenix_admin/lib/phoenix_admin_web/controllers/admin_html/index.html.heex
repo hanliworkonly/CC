@@ -1,0 +1,64 @@
+<div class="container" style="max-width: 400px; margin-top: 100px;">
+  <div class="card">
+    <h2 style="text-align: center; margin-bottom: 2rem;">登录</h2>
+
+    <div id="error-message" class="alert alert-error" style="display: none;"></div>
+
+    <form id="login-form">
+      <div class="form-group">
+        <label for="email">邮箱</label>
+        <input type="email" id="email" name="email" required placeholder="请输入邮箱">
+      </div>
+
+      <div class="form-group">
+        <label for="password">密码</label>
+        <input type="password" id="password" name="password" required placeholder="请输入密码">
+      </div>
+
+      <button type="submit" class="btn btn-primary" style="width: 100%;">登录</button>
+    </form>
+
+    <p style="text-align: center; margin-top: 1rem; color: #666;">
+      默认账号: admin@example.com / password
+    </p>
+  </div>
+</div>
+
+<script>
+  document.getElementById('login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    const email = document.getElementById('email').value;
+    const password = document.getElementById('password').value;
+    const errorDiv = document.getElementById('error-message');
+
+    try {
+      const response = await fetch('/api/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ email, password })
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        localStorage.setItem('token', data.token);
+        localStorage.setItem('user', JSON.stringify(data.user));
+        window.location.href = '/admin/dashboard';
+      } else {
+        errorDiv.textContent = data.error || '登录失败';
+        errorDiv.style.display = 'block';
+      }
+    } catch (error) {
+      errorDiv.textContent = '网络错误，请稍后重试';
+      errorDiv.style.display = 'block';
+    }
+  });
+
+  // If already logged in, redirect to dashboard
+  if (localStorage.getItem('token')) {
+    window.location.href = '/admin/dashboard';
+  }
+</script>
