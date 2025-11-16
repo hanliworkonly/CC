@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
 use tokio::time;
@@ -16,27 +16,120 @@ use tokio_util::sync::CancellationToken;
 
 use phantun::UDP_TTL;
 
-// Connection pool for load balancing
+// Connection info with health status
+struct SocketInfo {
+    socket: Arc<Socket>,
+    id: usize,
+    is_healthy: Arc<AtomicBool>,
+}
+
+// Connection pool for load balancing with health monitoring
 struct ConnectionPool {
-    sockets: Vec<Arc<Socket>>,
+    sockets: Arc<RwLock<Vec<SocketInfo>>>,
     next_idx: AtomicUsize,
+    target_count: usize,
+    #[allow(dead_code)] // Reserved for future auto-reconnection feature
+    remote_addr: SocketAddr,
 }
 
 impl ConnectionPool {
-    fn new(sockets: Vec<Arc<Socket>>) -> Self {
+    fn new(sockets: Vec<Arc<Socket>>, target_count: usize, remote_addr: SocketAddr) -> Self {
+        let socket_infos: Vec<SocketInfo> = sockets
+            .into_iter()
+            .enumerate()
+            .map(|(id, socket)| SocketInfo {
+                socket,
+                id,
+                is_healthy: Arc::new(AtomicBool::new(true)),
+            })
+            .collect();
+
         Self {
-            sockets,
+            sockets: Arc::new(RwLock::new(socket_infos)),
             next_idx: AtomicUsize::new(0),
+            target_count,
+            remote_addr,
         }
     }
 
-    fn get_next(&self) -> &Arc<Socket> {
-        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % self.sockets.len();
-        &self.sockets[idx]
+    async fn get_next(&self) -> Option<(Arc<Socket>, usize, Arc<AtomicBool>)> {
+        let sockets = self.sockets.read().await;
+
+        if sockets.is_empty() {
+            return None;
+        }
+
+        // Try to find a healthy connection (max attempts = socket count)
+        for _ in 0..sockets.len() {
+            let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % sockets.len();
+            let info = &sockets[idx];
+
+            if info.is_healthy.load(Ordering::Relaxed) {
+                return Some((info.socket.clone(), info.id, info.is_healthy.clone()));
+            }
+        }
+
+        // No healthy connection found, return first one as fallback
+        let info = &sockets[0];
+        Some((info.socket.clone(), info.id, info.is_healthy.clone()))
     }
 
-    fn get_all(&self) -> &[Arc<Socket>] {
-        &self.sockets
+    #[allow(dead_code)] // Reserved for future fine-grained health management
+    async fn mark_unhealthy(&self, id: usize) {
+        let sockets = self.sockets.read().await;
+        if let Some(info) = sockets.iter().find(|s| s.id == id) {
+            info.is_healthy.store(false, Ordering::Relaxed);
+            info!("Marked TCP connection {} as unhealthy", id);
+        }
+    }
+
+    async fn remove_unhealthy(&self) -> usize {
+        let mut sockets = self.sockets.write().await;
+        let before_count = sockets.len();
+        sockets.retain(|info| info.is_healthy.load(Ordering::Relaxed));
+        let removed = before_count - sockets.len();
+
+        if removed > 0 {
+            info!("Removed {} unhealthy connections, {} remaining", removed, sockets.len());
+        }
+
+        sockets.len()
+    }
+
+    #[allow(dead_code)] // Reserved for future auto-reconnection feature
+    async fn add_connection(&self, socket: Arc<Socket>) {
+        let mut sockets = self.sockets.write().await;
+        let id = sockets.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+
+        sockets.push(SocketInfo {
+            socket,
+            id,
+            is_healthy: Arc::new(AtomicBool::new(true)),
+        });
+
+        info!("Added new TCP connection {}, total: {}", id, sockets.len());
+    }
+
+    async fn get_all_sockets(&self) -> Vec<(Arc<Socket>, usize, Arc<AtomicBool>)> {
+        let sockets = self.sockets.read().await;
+        sockets
+            .iter()
+            .map(|info| (info.socket.clone(), info.id, info.is_healthy.clone()))
+            .collect()
+    }
+
+    async fn healthy_count(&self) -> usize {
+        let sockets = self.sockets.read().await;
+        sockets.iter().filter(|s| s.is_healthy.load(Ordering::Relaxed)).count()
+    }
+
+    fn target_count(&self) -> usize {
+        self.target_count
+    }
+
+    #[allow(dead_code)] // Reserved for future auto-reconnection feature
+    fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
     }
 }
 
@@ -228,8 +321,14 @@ async fn main() -> io::Result<()> {
             // 2. It is some extra packets not filtered by more specific
             //    connected UDP socket yet
             if let Some(pool) = connections.read().await.get(&udp_remote_addr) {
-                // Use round-robin to select next TCP connection
-                pool.get_next().send(&buf_r[..size]).await;
+                // Use round-robin to select next healthy TCP connection
+                if let Some((sock, conn_id, health)) = pool.get_next().await {
+                    if sock.send(&buf_r[..size]).await.is_none() {
+                        // Mark connection as unhealthy
+                        health.store(false, Ordering::Relaxed);
+                        debug!("Failed to send via connection {}, marked unhealthy", conn_id);
+                    }
+                }
                 continue;
             }
 
@@ -264,8 +363,14 @@ async fn main() -> io::Result<()> {
             }
 
             // Send first packet using round-robin
-            let pool = Arc::new(ConnectionPool::new(sockets));
-            if pool.get_next().send(&buf_r[..size]).await.is_none() {
+            let pool = Arc::new(ConnectionPool::new(sockets, num_tcp_conns, remote_addr));
+            if let Some((sock, conn_id, health)) = pool.get_next().await {
+                if sock.send(&buf_r[..size]).await.is_none() {
+                    health.store(false, Ordering::Relaxed);
+                    debug!("Failed to send first packet via connection {}", conn_id);
+                }
+            } else {
+                error!("No connections available in pool");
                 continue;
             }
 
@@ -283,12 +388,14 @@ async fn main() -> io::Result<()> {
             let quit = CancellationToken::new();
 
             // For each TCP connection, spawn workers
-            for (tcp_idx, sock) in pool.get_all().iter().enumerate() {
+            let all_sockets = pool.get_all_sockets().await;
+            for (sock, tcp_id, health) in all_sockets {
                 for i in 0..num_cpus {
                     let sock = sock.clone();
                     let pool = pool.clone();
                     let quit = quit.clone();
                     let packet_received = packet_received.clone();
+                    let health = health.clone();
 
                     tokio::spawn(async move {
                         let mut buf_udp = [0u8; MAX_PACKET_LEN];
@@ -325,11 +432,13 @@ async fn main() -> io::Result<()> {
                         loop {
                             tokio::select! {
                                 Ok(size) = udp_sock.recv(&mut buf_udp) => {
-                                    // Use round-robin to select TCP connection for sending
-                                    if pool.get_next().send(&buf_udp[..size]).await.is_none() {
-                                        debug!("removed fake TCP socket from connections table");
-                                        quit.cancel();
-                                        return;
+                                    // Use round-robin to select healthy TCP connection for sending
+                                    if let Some((send_sock, send_id, send_health)) = pool.get_next().await {
+                                        if send_sock.send(&buf_udp[..size]).await.is_none() {
+                                            send_health.store(false, Ordering::Relaxed);
+                                            debug!("Failed to send via connection {}, marked unhealthy", send_id);
+                                            // Continue trying other connections instead of quitting
+                                        }
                                     }
 
                                     packet_received.notify_one();
@@ -340,12 +449,15 @@ async fn main() -> io::Result<()> {
                                             if size > 0
                                                 && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
                                                     error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                                    health.store(false, Ordering::Relaxed);
                                                     quit.cancel();
                                                     return;
                                                 }
                                         },
                                         None => {
-                                            debug!("removed fake TCP socket from connections table");
+                                            // TCP connection closed, mark as unhealthy
+                                            health.store(false, Ordering::Relaxed);
+                                            info!("TCP connection {} closed by remote", tcp_id);
                                             quit.cancel();
                                             return;
                                         },
@@ -354,7 +466,7 @@ async fn main() -> io::Result<()> {
                                     packet_received.notify_one();
                                 },
                                 _ = quit.cancelled() => {
-                                    debug!("worker {} for TCP conn {} terminated", i, tcp_idx);
+                                    debug!("worker {} for TCP conn {} terminated", i, tcp_id);
                                     return;
                                 },
                             };
@@ -362,6 +474,43 @@ async fn main() -> io::Result<()> {
                     });
                 }
             }
+
+            // Spawn health monitoring task
+            let pool_for_health = pool.clone();
+            let quit_for_health = quit.clone();
+
+            tokio::spawn(async move {
+                let mut health_check_interval = time::interval(time::Duration::from_secs(10));
+
+                loop {
+                    tokio::select! {
+                        _ = health_check_interval.tick() => {
+                            // Check and remove unhealthy connections
+                            let remaining = pool_for_health.remove_unhealthy().await;
+                            let healthy = pool_for_health.healthy_count().await;
+                            let target = pool_for_health.target_count();
+
+                            if remaining < target {
+                                info!(
+                                    "Connection pool health: {}/{} healthy connections remaining",
+                                    healthy, target
+                                );
+                            }
+
+                            // If no healthy connections remain, cancel all workers
+                            if healthy == 0 && remaining == 0 {
+                                info!("All connections failed, terminating");
+                                quit_for_health.cancel();
+                                return;
+                            }
+                        },
+                        _ = quit_for_health.cancelled() => {
+                            debug!("Health monitoring task terminated");
+                            return;
+                        }
+                    }
+                }
+            });
 
             let connections = connections.clone();
             tokio::spawn(async move {

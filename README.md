@@ -18,9 +18,11 @@ This implementation adds the ability to **distribute a single UDP stream across 
 
 **Key benefits:**
 - 🚀 **Increased throughput**: Aggregate bandwidth across multiple TCP connections
-- ⚖️ **Load distribution**: Round-robin packet distribution
+- ⚖️ **Load distribution**: Smart round-robin packet distribution
 - 🔧 **Easy to use**: Single command-line parameter (`--num-tcp-conns`)
 - ✅ **Server compatible**: No server-side changes needed
+- 🛡️ **Fault tolerant**: Automatic failover when connections fail
+- 🔄 **Self-healing**: Graceful degradation with partial failures
 
 ## Architecture
 
@@ -51,9 +53,13 @@ UDP Application (e.g., WireGuard)
 ### Implementation Details
 
 1. **Connection Pool**: Each UDP source gets a pool of N TCP connections (configurable)
-2. **Round-Robin Distribution**: Outgoing UDP packets are distributed evenly using atomic counter
-3. **Independent Reception**: Each TCP connection can receive independently
-4. **Worker Scaling**: Each TCP connection spawns `num_cpus` workers for parallel processing
+2. **Smart Round-Robin Distribution**: Packets distributed to healthy connections using atomic counter
+3. **Health Monitoring**: Automatic detection and marking of failed connections
+4. **Automatic Failover**: Traffic automatically routed to healthy connections
+5. **Periodic Cleanup**: Failed connections removed every 10 seconds
+6. **Independent Reception**: Each TCP connection can receive independently
+7. **Worker Scaling**: Each TCP connection spawns `num_cpus` workers for parallel processing
+8. **Graceful Degradation**: System continues operating with reduced connections
 
 ### Code Changes
 
@@ -216,11 +222,20 @@ INFO Established TCP connection 4/4 for UDP client 127.0.0.1:xxxxx
 
 ## Documentation
 
-See [`LOAD_BALANCING.md`](./LOAD_BALANCING.md) for detailed documentation including:
+### Detailed Guides
+
+**[`LOAD_BALANCING.md`](./LOAD_BALANCING.md)** - Complete technical documentation:
 - Architecture deep-dive
 - Performance tuning
 - Troubleshooting guide
 - Future enhancement ideas
+
+**[`TCP_FAILURE_HANDLING.md`](./TCP_FAILURE_HANDLING.md)** - Failure handling & resilience:
+- TCP connection failure scenarios
+- Automatic failover mechanism
+- Health monitoring system
+- Self-healing capabilities
+- Testing failure scenarios
 
 ## Repository Structure
 
@@ -228,15 +243,16 @@ See [`LOAD_BALANCING.md`](./LOAD_BALANCING.md) for detailed documentation includ
 CC/
 ├── README.md                      # Project overview and usage guide
 ├── LOAD_BALANCING.md             # Detailed technical documentation
+├── TCP_FAILURE_HANDLING.md       # TCP failure handling & resilience guide
 ├── test_load_balancing.sh        # Automated validation tests
 ├── bin/                          # Pre-compiled binaries (ready to use)
-│   ├── client                    # Client with load balancing (3.7MB)
+│   ├── client                    # Client with load balancing (3.8MB)
 │   └── server                    # Server binary (3.6MB)
 └── phantun/                      # Complete Phantun source code
     ├── fake-tcp/                 # Fake TCP stack library
     ├── phantun/                  # Main client/server source
     │   └── src/bin/
-    │       ├── client.rs         # ✨ Load balancing implementation
+    │       ├── client.rs         # ✨ Load balancing + failure handling
     │       └── server.rs         # Server (unchanged)
     ├── debian/                   # Debian packaging
     ├── docker/                   # Docker support
@@ -246,13 +262,14 @@ CC/
 ### Key Files
 
 **Modified:**
-- `phantun/phantun/src/bin/client.rs` - Core load balancing implementation (394 lines)
+- `phantun/phantun/src/bin/client.rs` - Load balancing + TCP failure handling (550+ lines)
 
 **Added:**
-- `bin/client` - Pre-compiled client binary with load balancing
+- `bin/client` - Pre-compiled client binary with load balancing & failure handling
 - `bin/server` - Pre-compiled server binary
 - `README.md` - This file
 - `LOAD_BALANCING.md` - Detailed technical documentation
+- `TCP_FAILURE_HANDLING.md` - TCP failure handling & resilience guide
 - `test_load_balancing.sh` - Automated test script
 - `phantun/` - Complete Phantun source tree (v0.8.1 with modifications)
 
