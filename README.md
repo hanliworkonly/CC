@@ -4,7 +4,7 @@
 
 This repository implements the **load balancing of a single UDP stream into multiple TCP streams** feature for [Phantun](https://github.com/dndx/phantun), a lightweight and fast UDP to TCP obfuscator.
 
-This feature was listed as a "Future plan" in the original Phantun README (line 352) and is now fully implemented and working.
+This feature was listed as a "Future plan" in the original Phantun README (line 352). Phase 1 is now implemented with client-side session handshake and server-side handshake filtering.
 
 ## What is Phantun?
 
@@ -17,13 +17,18 @@ Phantun is a project that obfuscates UDP packets into TCP connections. It create
 This implementation adds the ability to **distribute a single UDP stream across multiple TCP connections** for improved throughput and bandwidth utilization.
 
 **Key benefits:**
-- 🚀 **Increased throughput**: Aggregate bandwidth across multiple TCP connections
+- 🚀 **Upload throughput**: Aggregate upload bandwidth across multiple TCP connections
 - ⚖️ **Load distribution**: Smart round-robin packet distribution
 - 🔧 **Easy to use**: Single command-line parameter (`--num-tcp-conns`)
-- ✅ **Server compatible**: No server-side changes needed
+- 🔄 **Session protocol**: Client sends session handshake, server filters it
 - 🛡️ **Fault tolerant**: Automatic failover when connections fail
 - 🔄 **Self-healing**: Graceful degradation with partial failures
 - ⏱️ **Keepalive**: Automatic heartbeats prevent NAT/firewall timeouts
+
+**Current limitations (Phase 1)**:
+- ⚠️ **Backend sees multiple UDP clients**: Each TCP connection creates separate UDP socket
+- ⚠️ **Download bandwidth**: Not yet aggregated (Phase 2 will fix this)
+- ⚠️ **Stateful protocols**: May not work correctly yet (VPN, QUIC, games)
 
 ## Architecture
 
@@ -53,27 +58,41 @@ UDP Application (e.g., WireGuard)
 
 ### Implementation Details
 
+**Client-side (Phase 1 ✅ Complete)**:
 1. **Connection Pool**: Each UDP source gets a pool of N TCP connections (configurable)
-2. **Smart Round-Robin Distribution**: Packets distributed to healthy connections using atomic counter
-3. **Health Monitoring**: Automatic detection and marking of failed connections
-4. **Automatic Failover**: Traffic automatically routed to healthy connections
-5. **Keepalive Mechanism**: Periodic heartbeats (30s) prevent NAT/firewall timeouts
-6. **Activity Tracking**: Last activity timestamp updated on all send/receive operations
-7. **Periodic Cleanup**: Failed connections removed every 10 seconds
-8. **Independent Reception**: Each TCP connection can receive independently
-9. **Worker Scaling**: Each TCP connection spawns `num_cpus` workers for parallel processing
-10. **Graceful Degradation**: System continues operating with reduced connections
+2. **Session Handshake**: Generates MD5-based session ID and sends handshake on each connection
+3. **Smart Round-Robin Distribution**: Packets distributed to healthy connections using atomic counter
+4. **Health Monitoring**: Automatic detection and marking of failed connections
+5. **Automatic Failover**: Traffic automatically routed to healthy connections
+6. **Keepalive Mechanism**: Periodic heartbeats (30s) prevent NAT/firewall timeouts
+7. **Activity Tracking**: Last activity timestamp updated on all send/receive operations
+8. **Periodic Cleanup**: Failed connections removed every 10 seconds
+9. **Independent Reception**: Each TCP connection can receive independently
+10. **Worker Scaling**: Each TCP connection spawns `num_cpus` workers for parallel processing
+
+**Server-side (Phase 1 ✅ Complete)**:
+1. **Handshake Recognition**: Detects 22-byte session handshake packets
+2. **Handshake Filtering**: Doesn't forward handshake packets to UDP backend
+3. **Backward Compatible**: Non-session connections work as before
+
+**Server-side (Phase 2 🚧 TODO)**:
+1. **Session Table**: Map session_id to shared UDP socket
+2. **Socket Merging**: Multiple TCP connections share single UDP socket
+3. **Response Distribution**: Round-robin UDP responses to TCP connections
 
 ### Code Changes
 
-**Main changes in `phantun/src/bin/client.rs`:**
-- Added `ConnectionPool` struct for managing multiple TCP connections
-- Modified connection table from `HashMap<SocketAddr, Arc<Socket>>` to `HashMap<SocketAddr, Arc<ConnectionPool>>`
-- Added `--num-tcp-conns` command-line parameter (1-16 connections)
-- Implemented round-robin packet distribution using atomic operations
-- Enhanced worker spawning to handle all connections in the pool
+**Client (`phantun/src/bin/client.rs`)**:
+- Added `ConnectionPool` struct with health monitoring and keepalive
+- Added session protocol: `generate_session_id()`, `create_handshake_packet()`
+- Modified connection table: `HashMap<SocketAddr, Arc<ConnectionPool>>`
+- Added `--num-tcp-conns` parameter (1-16 connections, default 1)
+- Implemented round-robin using atomic operations
 
-**No server-side changes required** - the server naturally handles multiple incoming TCP connections.
+**Server (`phantun/src/bin/server.rs`)**:
+- Added session protocol constants and parse_handshake()
+- Modified TCP→UDP forwarding to filter session handshake packets
+- Added UdpSession struct (reserved for Phase 2)
 
 ## Usage
 

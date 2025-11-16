@@ -1,19 +1,106 @@
 use clap::{crate_version, Arg, ArgAction, Command};
 use fake_tcp::packet::MAX_PACKET_LEN;
-use fake_tcp::Stack;
-use log::{debug, error, info};
+use fake_tcp::{Socket, Stack};
+use log::{debug, error, info, warn};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, RwLock};
 use tokio::time;
 use tokio_tun::TunBuilder;
 use tokio_util::sync::CancellationToken;
 
 use phantun::UDP_TTL;
+
+// Session protocol configuration for multi-TCP load balancing
+const SESSION_MAGIC: &[u8; 4] = b"\xDE\xAD\xBE\xEF"; // Magic bytes to identify handshake
+const SESSION_HANDSHAKE_SIZE: usize = 22; // 4 (magic) + 16 (session_id) + 1 (index) + 1 (total)
+
+// UDP session that aggregates multiple TCP connections
+// TODO: Currently only handshake filtering is implemented. Future work will implement
+// full session merging where multiple TCP connections share a single UDP socket.
+#[allow(dead_code)]
+struct UdpSession {
+    session_id: [u8; 16],
+    udp_socket: Arc<UdpSocket>,
+    tcp_connections: Arc<RwLock<Vec<Arc<Socket>>>>,
+    next_tcp_idx: AtomicUsize,  // For round-robin UDP→TCP distribution
+    remote_addr: SocketAddr,
+    packet_received: Arc<Notify>,
+    quit: CancellationToken,
+}
+
+impl UdpSession {
+    async fn new(
+        session_id: [u8; 16],
+        remote_addr: SocketAddr,
+        backend_addr: SocketAddr,
+    ) -> io::Result<Self> {
+        let udp_sock = UdpSocket::bind(if backend_addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        }).await?;
+
+        udp_sock.connect(backend_addr).await?;
+
+        info!("Created UDP session {:02x?} with socket {} → backend {}",
+              &session_id[0..4], udp_sock.local_addr()?, backend_addr);
+
+        Ok(Self {
+            session_id,
+            udp_socket: Arc::new(udp_sock),
+            tcp_connections: Arc::new(RwLock::new(Vec::new())),
+            next_tcp_idx: AtomicUsize::new(0),
+            remote_addr: backend_addr,
+            packet_received: Arc::new(Notify::new()),
+            quit: CancellationToken::new(),
+        })
+    }
+
+    async fn add_connection(&self, sock: Arc<Socket>) {
+        let mut conns = self.tcp_connections.write().await;
+        conns.push(sock.clone());
+        info!("Added TCP connection to session {:02x?}, now {} connections",
+              &self.session_id[0..4], conns.len());
+    }
+
+    async fn get_next_tcp(&self) -> Option<Arc<Socket>> {
+        let conns = self.tcp_connections.read().await;
+        if conns.is_empty() {
+            return None;
+        }
+        let idx = self.next_tcp_idx.fetch_add(1, Ordering::Relaxed) % conns.len();
+        Some(conns[idx].clone())
+    }
+}
+
+// Parse session handshake packet
+fn parse_handshake(buf: &[u8]) -> Option<([u8; 16], u8, u8)> {
+    if buf.len() != SESSION_HANDSHAKE_SIZE {
+        return None;
+    }
+
+    // Check magic bytes
+    if &buf[0..4] != SESSION_MAGIC {
+        return None;
+    }
+
+    // Extract session ID
+    let mut session_id = [0u8; 16];
+    session_id.copy_from_slice(&buf[4..20]);
+
+    // Extract connection index and total
+    let conn_index = buf[20];
+    let total_conns = buf[21];
+
+    Some((session_id, conn_index, total_conns))
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -219,6 +306,17 @@ async fn main() -> io::Result<()> {
                             res = sock.recv(&mut buf_tcp) => {
                                 match res {
                                     Some(size) => {
+                                        // Check if this is a session handshake packet
+                                        if size == SESSION_HANDSHAKE_SIZE {
+                                            if let Some((session_id, conn_index, total_conns)) = parse_handshake(&buf_tcp[..size]) {
+                                                info!("Received session handshake: session={:02x?}, conn={}/{} - filtered (not forwarded to backend)",
+                                                      &session_id[0..4], conn_index + 1, total_conns);
+                                                packet_received.notify_one();
+                                                continue; // Don't forward handshake to UDP backend
+                                            }
+                                        }
+
+                                        // Forward normal data packets to UDP backend
                                         if size > 0
                                             && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
                                                 error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);

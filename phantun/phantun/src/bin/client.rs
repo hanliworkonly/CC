@@ -2,6 +2,7 @@ use clap::{crate_version, Arg, ArgAction, Command};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info};
+use md5::{Md5, Digest};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
 use std::collections::HashMap;
 use std::fs;
@@ -19,6 +20,28 @@ use phantun::UDP_TTL;
 // Keepalive configuration
 const KEEPALIVE_INTERVAL: time::Duration = time::Duration::from_secs(30);
 const KEEPALIVE_PACKET: &[u8] = &[0u8; 1]; // 1-byte keepalive packet
+
+// Session protocol configuration for multi-TCP load balancing
+const SESSION_MAGIC: &[u8; 4] = b"\xDE\xAD\xBE\xEF"; // Magic bytes to identify handshake
+const SESSION_HANDSHAKE_SIZE: usize = 22; // 4 (magic) + 16 (session_id) + 1 (index) + 1 (total)
+
+// Generate session ID from UDP client address using MD5
+fn generate_session_id(udp_addr: &SocketAddr) -> [u8; 16] {
+    let mut hasher = Md5::new();
+    hasher.update(udp_addr.to_string().as_bytes());
+    let result = hasher.finalize();
+    result.into()
+}
+
+// Create session handshake packet
+fn create_handshake_packet(session_id: &[u8; 16], conn_index: u8, total_conns: u8) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(SESSION_HANDSHAKE_SIZE);
+    packet.extend_from_slice(SESSION_MAGIC);      // 4 bytes: magic
+    packet.extend_from_slice(session_id);         // 16 bytes: session ID
+    packet.push(conn_index);                      // 1 byte: connection index
+    packet.push(total_conns);                     // 1 byte: total connections
+    packet
+}
 
 // Connection info with health status and keepalive tracking
 struct SocketInfo {
@@ -368,6 +391,13 @@ async fn main() -> io::Result<()> {
 
             info!("New UDP client from {}, creating {} TCP connections", udp_remote_addr, num_tcp_conns);
 
+            // Generate session ID for multi-connection load balancing
+            let session_id = if num_tcp_conns > 1 {
+                Some(generate_session_id(&udp_remote_addr))
+            } else {
+                None
+            };
+
             // Create multiple TCP connections for load balancing
             let mut sockets = Vec::new();
             for i in 0..num_tcp_conns {
@@ -378,6 +408,8 @@ async fn main() -> io::Result<()> {
                 }
 
                 let sock = Arc::new(sock.unwrap());
+
+                // Send optional handshake packet (for compatibility with original protocol)
                 if let Some(ref p) = handshake_packet {
                     if sock.send(p).await.is_none() {
                         error!("Failed to send handshake packet to remote on connection {}/{}, closing connection.", i+1, num_tcp_conns);
@@ -385,6 +417,17 @@ async fn main() -> io::Result<()> {
                     }
 
                     debug!("Sent handshake packet to: {} (connection {}/{})", sock, i+1, num_tcp_conns);
+                }
+
+                // Send session handshake for multi-connection load balancing
+                if let Some(ref sid) = session_id {
+                    let session_handshake = create_handshake_packet(sid, i as u8, num_tcp_conns as u8);
+                    if sock.send(&session_handshake).await.is_none() {
+                        error!("Failed to send session handshake on connection {}/{}, closing connection.", i+1, num_tcp_conns);
+                        continue;
+                    }
+                    debug!("Sent session handshake for session {:02x?} on connection {}/{}",
+                           &sid[0..4], i+1, num_tcp_conns);
                 }
 
                 sockets.push(sock);
