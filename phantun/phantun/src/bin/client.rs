@@ -16,11 +16,16 @@ use tokio_util::sync::CancellationToken;
 
 use phantun::UDP_TTL;
 
-// Connection info with health status
+// Keepalive configuration
+const KEEPALIVE_INTERVAL: time::Duration = time::Duration::from_secs(30);
+const KEEPALIVE_PACKET: &[u8] = &[0u8; 1]; // 1-byte keepalive packet
+
+// Connection info with health status and keepalive tracking
 struct SocketInfo {
     socket: Arc<Socket>,
     id: usize,
     is_healthy: Arc<AtomicBool>,
+    last_activity: Arc<RwLock<time::Instant>>,
 }
 
 // Connection pool for load balancing with health monitoring
@@ -34,6 +39,7 @@ struct ConnectionPool {
 
 impl ConnectionPool {
     fn new(sockets: Vec<Arc<Socket>>, target_count: usize, remote_addr: SocketAddr) -> Self {
+        let now = time::Instant::now();
         let socket_infos: Vec<SocketInfo> = sockets
             .into_iter()
             .enumerate()
@@ -41,6 +47,7 @@ impl ConnectionPool {
                 socket,
                 id,
                 is_healthy: Arc::new(AtomicBool::new(true)),
+                last_activity: Arc::new(RwLock::new(now)),
             })
             .collect();
 
@@ -52,7 +59,7 @@ impl ConnectionPool {
         }
     }
 
-    async fn get_next(&self) -> Option<(Arc<Socket>, usize, Arc<AtomicBool>)> {
+    async fn get_next(&self) -> Option<(Arc<Socket>, usize, Arc<AtomicBool>, Arc<RwLock<time::Instant>>)> {
         let sockets = self.sockets.read().await;
 
         if sockets.is_empty() {
@@ -65,13 +72,31 @@ impl ConnectionPool {
             let info = &sockets[idx];
 
             if info.is_healthy.load(Ordering::Relaxed) {
-                return Some((info.socket.clone(), info.id, info.is_healthy.clone()));
+                return Some((
+                    info.socket.clone(),
+                    info.id,
+                    info.is_healthy.clone(),
+                    info.last_activity.clone(),
+                ));
             }
         }
 
         // No healthy connection found, return first one as fallback
         let info = &sockets[0];
-        Some((info.socket.clone(), info.id, info.is_healthy.clone()))
+        Some((
+            info.socket.clone(),
+            info.id,
+            info.is_healthy.clone(),
+            info.last_activity.clone(),
+        ))
+    }
+
+    #[allow(dead_code)] // Reserved for API completeness
+    async fn update_activity(&self, id: usize) {
+        let sockets = self.sockets.read().await;
+        if let Some(info) = sockets.iter().find(|s| s.id == id) {
+            *info.last_activity.write().await = time::Instant::now();
+        }
     }
 
     #[allow(dead_code)] // Reserved for future fine-grained health management
@@ -105,16 +130,22 @@ impl ConnectionPool {
             socket,
             id,
             is_healthy: Arc::new(AtomicBool::new(true)),
+            last_activity: Arc::new(RwLock::new(time::Instant::now())),
         });
 
         info!("Added new TCP connection {}, total: {}", id, sockets.len());
     }
 
-    async fn get_all_sockets(&self) -> Vec<(Arc<Socket>, usize, Arc<AtomicBool>)> {
+    async fn get_all_sockets(&self) -> Vec<(Arc<Socket>, usize, Arc<AtomicBool>, Arc<RwLock<time::Instant>>)> {
         let sockets = self.sockets.read().await;
         sockets
             .iter()
-            .map(|info| (info.socket.clone(), info.id, info.is_healthy.clone()))
+            .map(|info| (
+                info.socket.clone(),
+                info.id,
+                info.is_healthy.clone(),
+                info.last_activity.clone(),
+            ))
             .collect()
     }
 
@@ -322,8 +353,11 @@ async fn main() -> io::Result<()> {
             //    connected UDP socket yet
             if let Some(pool) = connections.read().await.get(&udp_remote_addr) {
                 // Use round-robin to select next healthy TCP connection
-                if let Some((sock, conn_id, health)) = pool.get_next().await {
-                    if sock.send(&buf_r[..size]).await.is_none() {
+                if let Some((sock, conn_id, health, last_activity)) = pool.get_next().await {
+                    if sock.send(&buf_r[..size]).await.is_some() {
+                        // Update activity time on successful send
+                        *last_activity.write().await = time::Instant::now();
+                    } else {
                         // Mark connection as unhealthy
                         health.store(false, Ordering::Relaxed);
                         debug!("Failed to send via connection {}, marked unhealthy", conn_id);
@@ -364,8 +398,10 @@ async fn main() -> io::Result<()> {
 
             // Send first packet using round-robin
             let pool = Arc::new(ConnectionPool::new(sockets, num_tcp_conns, remote_addr));
-            if let Some((sock, conn_id, health)) = pool.get_next().await {
-                if sock.send(&buf_r[..size]).await.is_none() {
+            if let Some((sock, conn_id, health, last_activity)) = pool.get_next().await {
+                if sock.send(&buf_r[..size]).await.is_some() {
+                    *last_activity.write().await = time::Instant::now();
+                } else {
                     health.store(false, Ordering::Relaxed);
                     debug!("Failed to send first packet via connection {}", conn_id);
                 }
@@ -389,13 +425,14 @@ async fn main() -> io::Result<()> {
 
             // For each TCP connection, spawn workers
             let all_sockets = pool.get_all_sockets().await;
-            for (sock, tcp_id, health) in all_sockets {
+            for (sock, tcp_id, health, last_activity) in all_sockets {
                 for i in 0..num_cpus {
                     let sock = sock.clone();
                     let pool = pool.clone();
                     let quit = quit.clone();
                     let packet_received = packet_received.clone();
                     let health = health.clone();
+                    let last_activity = last_activity.clone();
 
                     tokio::spawn(async move {
                         let mut buf_udp = [0u8; MAX_PACKET_LEN];
@@ -433,8 +470,11 @@ async fn main() -> io::Result<()> {
                             tokio::select! {
                                 Ok(size) = udp_sock.recv(&mut buf_udp) => {
                                     // Use round-robin to select healthy TCP connection for sending
-                                    if let Some((send_sock, send_id, send_health)) = pool.get_next().await {
-                                        if send_sock.send(&buf_udp[..size]).await.is_none() {
+                                    if let Some((send_sock, send_id, send_health, send_activity)) = pool.get_next().await {
+                                        if send_sock.send(&buf_udp[..size]).await.is_some() {
+                                            // Update activity on successful send
+                                            *send_activity.write().await = time::Instant::now();
+                                        } else {
                                             send_health.store(false, Ordering::Relaxed);
                                             debug!("Failed to send via connection {}, marked unhealthy", send_id);
                                             // Continue trying other connections instead of quitting
@@ -446,13 +486,17 @@ async fn main() -> io::Result<()> {
                                 res = sock.recv(&mut buf_tcp) => {
                                     match res {
                                         Some(size) => {
-                                            if size > 0
-                                                && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
+                                            if size > 0 {
+                                                // Update activity on receive
+                                                *last_activity.write().await = time::Instant::now();
+
+                                                if let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
                                                     error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
                                                     health.store(false, Ordering::Relaxed);
                                                     quit.cancel();
                                                     return;
                                                 }
+                                            }
                                         },
                                         None => {
                                             // TCP connection closed, mark as unhealthy
@@ -474,6 +518,47 @@ async fn main() -> io::Result<()> {
                     });
                 }
             }
+
+            // Spawn keepalive task to send periodic heartbeats
+            let pool_for_keepalive = pool.clone();
+            let quit_for_keepalive = quit.clone();
+
+            tokio::spawn(async move {
+                let mut keepalive_interval = time::interval(KEEPALIVE_INTERVAL);
+
+                loop {
+                    tokio::select! {
+                        _ = keepalive_interval.tick() => {
+                            let sockets = pool_for_keepalive.get_all_sockets().await;
+                            let now = time::Instant::now();
+
+                            for (sock, id, health, last_activity) in sockets {
+                                if !health.load(Ordering::Relaxed) {
+                                    continue; // Skip unhealthy connections
+                                }
+
+                                let last_active = *last_activity.read().await;
+                                let idle_duration = now.duration_since(last_active);
+
+                                // Send keepalive if connection has been idle
+                                if idle_duration >= KEEPALIVE_INTERVAL {
+                                    debug!("Sending keepalive on connection {} (idle for {:?})", id, idle_duration);
+                                    if sock.send(KEEPALIVE_PACKET).await.is_some() {
+                                        *last_activity.write().await = now;
+                                    } else {
+                                        health.store(false, Ordering::Relaxed);
+                                        debug!("Keepalive failed on connection {}, marked unhealthy", id);
+                                    }
+                                }
+                            }
+                        },
+                        _ = quit_for_keepalive.cancelled() => {
+                            debug!("Keepalive task terminated");
+                            return;
+                        }
+                    }
+                }
+            });
 
             // Spawn health monitoring task
             let pool_for_health = pool.clone();
