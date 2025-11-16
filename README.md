@@ -68,6 +68,20 @@ UDP Application (e.g., WireGuard)
 
 ## Usage
 
+### Quick Start (Pre-compiled Binaries)
+
+For immediate use without building from source, pre-compiled binaries are included in the `bin/` directory:
+
+```bash
+# Client with load balancing
+sudo ./bin/client --local 127.0.0.1:1234 --remote SERVER_IP:4567 --num-tcp-conns 4
+
+# Server
+sudo ./bin/server --local 4567 --remote 127.0.0.1:1234
+```
+
+**Note**: Binaries are for Linux x86_64 architecture. For other platforms, see Building section below.
+
 ### Building
 
 ```bash
@@ -105,11 +119,19 @@ Load balance WireGuard traffic across 4 TCP connections:
 
 **Server:**
 ```bash
+# Using pre-compiled binary
+sudo ./bin/server --local 4567 --remote 127.0.0.1:51820
+
+# Or using built binary
 sudo ./phantun/target/release/server --local 4567 --remote 127.0.0.1:51820
 ```
 
 **Client:**
 ```bash
+# Using pre-compiled binary
+sudo ./bin/client --local 127.0.0.1:51820 --remote VPN_SERVER:4567 --num-tcp-conns 4
+
+# Or using built binary
 sudo ./phantun/target/release/client --local 127.0.0.1:51820 --remote VPN_SERVER:4567 --num-tcp-conns 4
 ```
 
@@ -138,12 +160,12 @@ This validates:
 
 2. **Terminal 2** - Start Phantun server:
    ```bash
-   sudo ./phantun/target/release/server --local 4567 --remote 127.0.0.1:9999
+   sudo ./bin/server --local 4567 --remote 127.0.0.1:9999
    ```
 
 3. **Terminal 3** - Start Phantun client with load balancing:
    ```bash
-   sudo ./phantun/target/release/client --local 127.0.0.1:8888 --remote 127.0.0.1:4567 --num-tcp-conns 4
+   sudo ./bin/client --local 127.0.0.1:8888 --remote 127.0.0.1:4567 --num-tcp-conns 4
    ```
 
 4. **Terminal 4** - Send test data:
@@ -200,15 +222,39 @@ See [`LOAD_BALANCING.md`](./LOAD_BALANCING.md) for detailed documentation includ
 - Troubleshooting guide
 - Future enhancement ideas
 
-## Files Modified/Added
+## Repository Structure
 
-### Modified Files
-- `phantun/src/bin/client.rs` - Core load balancing implementation
+```
+CC/
+├── README.md                      # Project overview and usage guide
+├── LOAD_BALANCING.md             # Detailed technical documentation
+├── test_load_balancing.sh        # Automated validation tests
+├── bin/                          # Pre-compiled binaries (ready to use)
+│   ├── client                    # Client with load balancing (3.7MB)
+│   └── server                    # Server binary (3.6MB)
+└── phantun/                      # Complete Phantun source code
+    ├── fake-tcp/                 # Fake TCP stack library
+    ├── phantun/                  # Main client/server source
+    │   └── src/bin/
+    │       ├── client.rs         # ✨ Load balancing implementation
+    │       └── server.rs         # Server (unchanged)
+    ├── debian/                   # Debian packaging
+    ├── docker/                   # Docker support
+    └── target/                   # Build artifacts (gitignored)
+```
 
-### Added Files
+### Key Files
+
+**Modified:**
+- `phantun/phantun/src/bin/client.rs` - Core load balancing implementation (394 lines)
+
+**Added:**
+- `bin/client` - Pre-compiled client binary with load balancing
+- `bin/server` - Pre-compiled server binary
 - `README.md` - This file
-- `LOAD_BALANCING.md` - Detailed documentation
+- `LOAD_BALANCING.md` - Detailed technical documentation
 - `test_load_balancing.sh` - Automated test script
+- `phantun/` - Complete Phantun source tree (v0.8.1 with modifications)
 
 ## Technical Details
 
