@@ -22,14 +22,12 @@ const SESSION_MAGIC: &[u8; 4] = b"\xDE\xAD\xBE\xEF"; // Magic bytes to identify 
 const SESSION_HANDSHAKE_SIZE: usize = 22; // 4 (magic) + 16 (session_id) + 1 (index) + 1 (total)
 
 // UDP session that aggregates multiple TCP connections
-// TODO: Currently only handshake filtering is implemented. Future work will implement
-// full session merging where multiple TCP connections share a single UDP socket.
-#[allow(dead_code)]
 struct UdpSession {
     session_id: [u8; 16],
     udp_socket: Arc<UdpSocket>,
     tcp_connections: Arc<RwLock<Vec<Arc<Socket>>>>,
     next_tcp_idx: AtomicUsize,  // For round-robin UDP→TCP distribution
+    #[allow(dead_code)] // Reserved for future reconnection/monitoring features
     remote_addr: SocketAddr,
     packet_received: Arc<Notify>,
     quit: CancellationToken,
@@ -38,7 +36,7 @@ struct UdpSession {
 impl UdpSession {
     async fn new(
         session_id: [u8; 16],
-        remote_addr: SocketAddr,
+        _remote_addr: SocketAddr,
         backend_addr: SocketAddr,
     ) -> io::Result<Self> {
         let udp_sock = UdpSocket::bind(if backend_addr.is_ipv4() {
@@ -258,102 +256,254 @@ async fn main() -> io::Result<()> {
     info!("Listening on {}", local_port);
 
     let main_loop = tokio::spawn(async move {
-        let mut buf_udp = [0u8; MAX_PACKET_LEN];
-        let mut buf_tcp = [0u8; MAX_PACKET_LEN];
+        // Session table for multi-TCP load balancing
+        let sessions: Arc<RwLock<HashMap<[u8; 16], Arc<UdpSession>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         loop {
             let sock = Arc::new(stack.accept().await);
             info!("New connection: {}", sock);
+
+            // Send optional compatibility handshake packet
             if let Some(ref p) = handshake_packet {
                 if sock.send(p).await.is_none() {
                     error!("Failed to send handshake packet to remote, closing connection.");
                     continue;
                 }
-
                 debug!("Sent handshake packet to: {}", sock);
             }
 
-            let packet_received = Arc::new(Notify::new());
-            let quit = CancellationToken::new();
-            let udp_sock = UdpSocket::bind(if remote_addr.is_ipv4() {
-                "0.0.0.0:0"
-            } else {
-                "[::]:0"
-            })
-            .await?;
-            let local_addr = udp_sock.local_addr()?;
-            drop(udp_sock);
+            let sessions_clone = sessions.clone();
+            let remote_addr_clone = remote_addr;
+            let num_cpus_clone = num_cpus;
 
-            for i in 0..num_cpus {
-                let sock = sock.clone();
-                let quit = quit.clone();
-                let packet_received = packet_received.clone();
-                let udp_sock = new_udp_reuseport(local_addr);
+            // Spawn task to handle this connection
+            tokio::spawn(async move {
+                let mut buf_tcp = [0u8; MAX_PACKET_LEN];
 
-                tokio::spawn(async move {
-                    udp_sock.connect(remote_addr).await.unwrap();
+                // Read first packet to determine if this is a session connection
+                let first_packet = match sock.recv(&mut buf_tcp).await {
+                    Some(size) if size > 0 => Some((buf_tcp[..size].to_vec(), size)),
+                    _ => {
+                        warn!("Connection closed immediately after accept");
+                        return;
+                    }
+                };
 
-                    loop {
-                        tokio::select! {
-                            Ok(size) = udp_sock.recv(&mut buf_udp) => {
-                                if sock.send(&buf_udp[..size]).await.is_none() {
-                                    quit.cancel();
+                if let Some((first_pkt_vec, _first_pkt_size)) = first_packet {
+                    // Try to parse as session handshake
+                    if let Some((session_id, conn_index, total_conns)) = parse_handshake(&first_pkt_vec) {
+                        info!("Session handshake detected: session={:02x?}, conn={}/{}",
+                              &session_id[0..4], conn_index + 1, total_conns);
+
+                        // Get or create session
+                        let session = {
+                            let mut sessions_map = sessions_clone.write().await;
+                            if let Some(existing_session) = sessions_map.get(&session_id) {
+                                debug!("Joining existing session {:02x?}", &session_id[0..4]);
+                                existing_session.clone()
+                            } else {
+                                match UdpSession::new(session_id, remote_addr_clone, remote_addr_clone).await {
+                                    Ok(new_session) => {
+                                        let session_arc = Arc::new(new_session);
+                                        sessions_map.insert(session_id, session_arc.clone());
+                                        info!("Created new session {:02x?}", &session_id[0..4]);
+
+                                        // Start UDP→TCP forwarding workers for this new session
+                                        for i in 0..num_cpus_clone {
+                                            let session_worker = session_arc.clone();
+                                            tokio::spawn(async move {
+                                                let mut buf = [0u8; MAX_PACKET_LEN];
+                                                loop {
+                                                    tokio::select! {
+                                                        Ok(size) = session_worker.udp_socket.recv(&mut buf) => {
+                                                            if let Some(tcp_sock) = session_worker.get_next_tcp().await {
+                                                                if tcp_sock.send(&buf[..size]).await.is_some() {
+                                                                    session_worker.packet_received.notify_one();
+                                                                }
+                                                            }
+                                                        },
+                                                        _ = session_worker.quit.cancelled() => {
+                                                            debug!("Session {:02x?} UDP→TCP worker {} terminated",
+                                                                   &session_worker.session_id[0..4], i);
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+
+                                        // Start session timeout monitor
+                                        let session_monitor = session_arc.clone();
+                                        let session_id_copy = session_id;
+                                        let sessions_for_cleanup = sessions_clone.clone();
+                                        tokio::spawn(async move {
+                                            loop {
+                                                let read_timeout = time::sleep(UDP_TTL);
+                                                let packet_received_fut = session_monitor.packet_received.notified();
+
+                                                tokio::select! {
+                                                    _ = read_timeout => {
+                                                        info!("Session {:02x?} timeout after {:?}, closing",
+                                                              &session_id_copy[0..4], UDP_TTL);
+                                                        session_monitor.quit.cancel();
+                                                        sessions_for_cleanup.write().await.remove(&session_id_copy);
+                                                        return;
+                                                    },
+                                                    _ = packet_received_fut => {},
+                                                }
+                                            }
+                                        });
+
+                                        session_arc
+                                    },
+                                    Err(e) => {
+                                        error!("Failed to create UDP session: {}", e);
+                                        return;
+                                    }
+                                }
+                            }
+                        };
+
+                        // Add this TCP connection to the session
+                        session.add_connection(sock.clone()).await;
+
+                        // Start TCP→UDP forwarding for this connection
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; MAX_PACKET_LEN];
+                            loop {
+                                tokio::select! {
+                                    res = sock.recv(&mut buf) => {
+                                        match res {
+                                            Some(size) if size > 0 => {
+                                                if let Err(e) = session.udp_socket.send(&buf[..size]).await {
+                                                    error!("Failed to send to UDP backend: {}", e);
+                                                    return;
+                                                }
+                                                session.packet_received.notify_one();
+                                            },
+                                            _ => {
+                                                debug!("TCP connection closed in session {:02x?}",
+                                                       &session.session_id[0..4]);
+                                                return;
+                                            }
+                                        }
+                                    },
+                                    _ = session.quit.cancelled() => {
+                                        debug!("Session quit signal received");
+                                        return;
+                                    }
+                                }
+                            }
+                        });
+
+                    } else {
+                        // Not a session handshake - use legacy single-connection mode
+                        info!("Non-session connection detected, using legacy mode");
+
+                        let packet_received = Arc::new(Notify::new());
+                        let quit = CancellationToken::new();
+
+                        let udp_sock = match UdpSocket::bind(if remote_addr_clone.is_ipv4() {
+                            "0.0.0.0:0"
+                        } else {
+                            "[::]:0"
+                        }).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!("Failed to bind UDP socket: {}", e);
+                                return;
+                            }
+                        };
+
+                        let local_addr = match udp_sock.local_addr() {
+                            Ok(addr) => addr,
+                            Err(e) => {
+                                error!("Failed to get local address: {}", e);
+                                return;
+                            }
+                        };
+                        drop(udp_sock);
+
+                        // Forward the first packet (it's actual data, not handshake)
+                        let first_packet_data = first_pkt_vec;
+
+                        for i in 0..num_cpus_clone {
+                            let sock_worker = sock.clone();
+                            let quit_worker = quit.clone();
+                            let packet_received_worker = packet_received.clone();
+                            let udp_sock = new_udp_reuseport(local_addr);
+                            let first_data = if i == 0 { Some(first_packet_data.clone()) } else { None };
+
+                            tokio::spawn(async move {
+                                let mut buf_worker_tcp = [0u8; MAX_PACKET_LEN];
+                                let mut buf_worker_udp = [0u8; MAX_PACKET_LEN];
+
+                                if udp_sock.connect(remote_addr_clone).await.is_err() {
+                                    error!("Failed to connect UDP socket");
                                     return;
                                 }
 
-                                packet_received.notify_one();
-                            },
-                            res = sock.recv(&mut buf_tcp) => {
-                                match res {
-                                    Some(size) => {
-                                        // Check if this is a session handshake packet
-                                        if size == SESSION_HANDSHAKE_SIZE {
-                                            if let Some((session_id, conn_index, total_conns)) = parse_handshake(&buf_tcp[..size]) {
-                                                info!("Received session handshake: session={:02x?}, conn={}/{} - filtered (not forwarded to backend)",
-                                                      &session_id[0..4], conn_index + 1, total_conns);
-                                                packet_received.notify_one();
-                                                continue; // Don't forward handshake to UDP backend
-                                            }
-                                        }
+                                // Send first packet if this is worker 0
+                                if let Some(data) = first_data {
+                                    if let Err(e) = udp_sock.send(&data).await {
+                                        error!("Failed to send first packet to UDP backend: {}", e);
+                                        quit_worker.cancel();
+                                        return;
+                                    }
+                                    packet_received_worker.notify_one();
+                                }
 
-                                        // Forward normal data packets to UDP backend
-                                        if size > 0
-                                            && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
-                                                error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
-                                                quit.cancel();
+                                loop {
+                                    tokio::select! {
+                                        Ok(size) = udp_sock.recv(&mut buf_worker_udp) => {
+                                            if sock_worker.send(&buf_worker_udp[..size]).await.is_none() {
+                                                quit_worker.cancel();
                                                 return;
                                             }
-                                    },
-                                    None => {
+                                            packet_received_worker.notify_one();
+                                        },
+                                        res = sock_worker.recv(&mut buf_worker_tcp) => {
+                                            match res {
+                                                Some(size) if size > 0 => {
+                                                    if let Err(e) = udp_sock.send(&buf_worker_tcp[..size]).await {
+                                                        error!("Unable to send UDP packet: {}", e);
+                                                        quit_worker.cancel();
+                                                        return;
+                                                    }
+                                                },
+                                                _ => {
+                                                    quit_worker.cancel();
+                                                    return;
+                                                }
+                                            }
+                                            packet_received_worker.notify_one();
+                                        },
+                                        _ = quit_worker.cancelled() => {
+                                            debug!("Legacy worker {} terminated", i);
+                                            return;
+                                        }
+                                    }
+                                }
+                            });
+                        }
+
+                        // Timeout monitor for legacy mode
+                        tokio::spawn(async move {
+                            loop {
+                                let read_timeout = time::sleep(UDP_TTL);
+                                let packet_received_fut = packet_received.notified();
+
+                                tokio::select! {
+                                    _ = read_timeout => {
+                                        info!("No traffic seen in the last {:?}, closing connection", UDP_TTL);
                                         quit.cancel();
                                         return;
                                     },
+                                    _ = packet_received_fut => {},
                                 }
-
-                                packet_received.notify_one();
-                            },
-                            _ = quit.cancelled() => {
-                                debug!("worker {} terminated", i);
-                                return;
-                            },
-                        };
-                    }
-                });
-            }
-
-            tokio::spawn(async move {
-                loop {
-                    let read_timeout = time::sleep(UDP_TTL);
-                    let packet_received_fut = packet_received.notified();
-
-                    tokio::select! {
-                        _ = read_timeout => {
-                            info!("No traffic seen in the last {:?}, closing connection", UDP_TTL);
-
-                            quit.cancel();
-                            return;
-                        },
-                        _ = packet_received_fut => {},
+                            }
+                        });
                     }
                 }
             });

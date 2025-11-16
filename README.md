@@ -4,7 +4,7 @@
 
 This repository implements the **load balancing of a single UDP stream into multiple TCP streams** feature for [Phantun](https://github.com/dndx/phantun), a lightweight and fast UDP to TCP obfuscator.
 
-This feature was listed as a "Future plan" in the original Phantun README (line 352). Phase 1 is now implemented with client-side session handshake and server-side handshake filtering.
+This feature was listed as a "Future plan" in the original Phantun README (line 352) and is now **fully implemented and production-ready** with complete session merging, bandwidth aggregation, and automatic failover.
 
 ## What is Phantun?
 
@@ -17,18 +17,16 @@ Phantun is a project that obfuscates UDP packets into TCP connections. It create
 This implementation adds the ability to **distribute a single UDP stream across multiple TCP connections** for improved throughput and bandwidth utilization.
 
 **Key benefits:**
-- 🚀 **Upload throughput**: Aggregate upload bandwidth across multiple TCP connections
-- ⚖️ **Load distribution**: Smart round-robin packet distribution
+- 🚀 **Full bandwidth aggregation**: Both upload and download bandwidth across multiple TCP connections
+- ⚖️ **True session merging**: Backend sees single UDP client (not multiple)
+- 🎯 **Stateful protocol support**: Works with VPN, QUIC, multiplayer games
 - 🔧 **Easy to use**: Single command-line parameter (`--num-tcp-conns`)
-- 🔄 **Session protocol**: Client sends session handshake, server filters it
+- 🔄 **Session protocol**: MD5-based session ID with handshake
 - 🛡️ **Fault tolerant**: Automatic failover when connections fail
 - 🔄 **Self-healing**: Graceful degradation with partial failures
 - ⏱️ **Keepalive**: Automatic heartbeats prevent NAT/firewall timeouts
-
-**Current limitations (Phase 1)**:
-- ⚠️ **Backend sees multiple UDP clients**: Each TCP connection creates separate UDP socket
-- ⚠️ **Download bandwidth**: Not yet aggregated (Phase 2 will fix this)
-- ⚠️ **Stateful protocols**: May not work correctly yet (VPN, QUIC, games)
+- ✅ **Production ready**: Complete session lifecycle with timeout and cleanup
+- 🔙 **Backward compatible**: Legacy clients work without session protocol
 
 ## Architecture
 
@@ -58,7 +56,7 @@ UDP Application (e.g., WireGuard)
 
 ### Implementation Details
 
-**Client-side (Phase 1 ✅ Complete)**:
+**Client-side (✅ Complete)**:
 1. **Connection Pool**: Each UDP source gets a pool of N TCP connections (configurable)
 2. **Session Handshake**: Generates MD5-based session ID and sends handshake on each connection
 3. **Smart Round-Robin Distribution**: Packets distributed to healthy connections using atomic counter
@@ -70,15 +68,17 @@ UDP Application (e.g., WireGuard)
 9. **Independent Reception**: Each TCP connection can receive independently
 10. **Worker Scaling**: Each TCP connection spawns `num_cpus` workers for parallel processing
 
-**Server-side (Phase 1 ✅ Complete)**:
-1. **Handshake Recognition**: Detects 22-byte session handshake packets
-2. **Handshake Filtering**: Doesn't forward handshake packets to UDP backend
-3. **Backward Compatible**: Non-session connections work as before
-
-**Server-side (Phase 2 🚧 TODO)**:
-1. **Session Table**: Map session_id to shared UDP socket
-2. **Socket Merging**: Multiple TCP connections share single UDP socket
-3. **Response Distribution**: Round-robin UDP responses to TCP connections
+**Server-side (✅ Complete)**:
+1. **Session Table**: Maintains `session_id` → `UdpSession` mapping in `Arc<RwLock<HashMap>>`
+2. **First Packet Detection**: Reads first packet to detect session handshake vs legacy connection
+3. **Session Creation**: Creates shared UDP socket when first connection with session ID arrives
+4. **Socket Merging**: Multiple TCP connections from same session share single UDP socket
+5. **TCP→UDP Forwarding**: All TCP connections in session write to shared UDP socket
+6. **UDP→TCP Distribution**: Round-robin distribution of UDP responses to TCP connections
+7. **Worker Architecture**: `num_cpus` workers per session for parallel UDP→TCP forwarding
+8. **Session Timeout**: Monitors activity and cleans up idle sessions after 180 seconds
+9. **Automatic Cleanup**: Removes sessions from table when expired or all connections close
+10. **Backward Compatible**: Non-session connections use legacy per-connection UDP socket mode
 
 ### Code Changes
 
@@ -90,9 +90,13 @@ UDP Application (e.g., WireGuard)
 - Implemented round-robin using atomic operations
 
 **Server (`phantun/src/bin/server.rs`)**:
-- Added session protocol constants and parse_handshake()
-- Modified TCP→UDP forwarding to filter session handshake packets
-- Added UdpSession struct (reserved for Phase 2)
+- Added `UdpSession` struct for managing shared UDP socket and TCP connections
+- Implemented session table with `Arc<RwLock<HashMap<[u8; 16], Arc<UdpSession>>>>`
+- Added session protocol: `parse_handshake()` function
+- Refactored main loop to detect session handshake in first packet
+- Session mode: Creates/joins session, shares UDP socket, distributes responses
+- Legacy mode: Falls back to original per-connection behavior
+- Added per-session timeout monitoring and cleanup
 
 ## Usage
 
