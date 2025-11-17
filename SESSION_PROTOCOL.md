@@ -8,13 +8,11 @@
 - Backend UDP application doesn't receive unexpected handshake data
 - Multiple TCP connections still create separate UDP sockets (not yet merged)
 
-**Phase 2 (✅ COMPLETED)**: Full session merging for true load balancing
-- Server merges multiple TCP connections into single UDP socket
-- Backend sees single UDP client instead of multiple
-- True bandwidth aggregation across TCP paths (both upload and download)
-- Round-robin response distribution back to client TCP connections
-- Session timeout monitoring and cleanup
-- Backward compatible with non-session (legacy) connections
+**Phase 2 (⚠️ REVERTED DUE TO DEADLOCK)**: Full session merging attempted
+- **ISSUE**: Phase 2 implementation caused deadlock between client and server
+- Server blocked waiting for first packet, but client waits for UDP data
+- Reverted to Phase 1 to restore functionality
+- Phase 2 will be reimplemented with proper non-blocking architecture
 
 ## Overview
 
